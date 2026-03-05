@@ -38,7 +38,9 @@ def get_loaded_model():
     try:
         r = requests.get("http://localhost:1234/v1/models", timeout=5)
         if r.status_code == 200:
-            return r.json()["data"][0]["id"]
+            data = r.json().get("data", [])
+            if data:
+                return data[0]["id"]
     except Exception:
         pass
     return "local-model"
@@ -174,10 +176,10 @@ def spawn_particles(x, y, color, count=8, speed=2.5):
         _particles.extend(pts)
 
 def update_draw_particles(screen):
-    alive = []
     with _particles_lock:
         snap = list(_particles)
         _particles.clear()
+    alive = []
     for p in snap:
         p["x"] += p["vx"]; p["y"] += p["vy"]; p["vy"] += 0.09; p["life"] -= 1
         if p["life"] > 0:
@@ -189,6 +191,25 @@ def update_draw_particles(screen):
             alive.append(p)
     with _particles_lock:
         _particles.extend(alive)
+
+# ═══════════════════════════════════════════════════════════
+#  UTILITIES
+# ═══════════════════════════════════════════════════════════
+def wrap_text(text, font, max_width):
+    """Wrap text to fit within max_width pixels; returns list of line strings."""
+    words = text.split()
+    lines, line = [], ""
+    for word in words:
+        test = (line + " " + word).strip()
+        if font.size(test)[0] < max_width:
+            line = test
+        else:
+            if line:
+                lines.append(line)
+            line = word
+    if line:
+        lines.append(line)
+    return lines
 
 # ═══════════════════════════════════════════════════════════
 #  PIXEL ART
@@ -439,14 +460,7 @@ def draw_glow(screen,x,y,w,h,color,intensity=55):
         screen.blit(g,(x-i*7,y-i*7))
 
 def draw_speech_bubble(screen,font,text,x,y,color,t,max_w=230):
-    words=text.split(); lines,line=[],""
-    for w in words:
-        test=(line+" "+w).strip()
-        if font.size(test)[0]<max_w: line=test
-        else:
-            if line: lines.append(line)
-            line=w
-    if line: lines.append(line)
+    lines = wrap_text(text, font, max_w)
     lh=font.get_height()+2
     bw=max((font.size(l)[0] for l in lines),default=40)+16
     bh=len(lines)*lh+10; bx=x-bw//2; by=y-bh-22+int(3*math.sin(t*0.055))
@@ -463,8 +477,11 @@ def draw_speech_bubble(screen,font,text,x,y,color,t,max_w=230):
 #  MARKETING OVERLAY
 # ═══════════════════════════════════════════════════════════
 def draw_marketing_overlay(screen, art, font_mono, t):
-    global _marketing_timestamp
-    if not art or time.time() - _marketing_timestamp > 15:
+    if not art:
+        return
+    with _marketing_art_lock:
+        ts = _marketing_timestamp
+    if time.time() - ts > 15:
         return
     lines = art.split("\n")[:18]
     box_w = 430; box_h = len(lines)*14+28
@@ -519,15 +536,7 @@ def draw_ticket_panel(screen, font_small, t):
         screen.blit(font_small.render(f"[{tk['time']}]", True, (80, 120, 140)), (px + 10, ty2 + 4))
         
         words2 = tk["text"][:140].split()
-        tl, tls = "", []
-        for w in words2:
-            test2 = (tl + " " + w).strip()
-            if font_small.size(test2)[0] < panel_w - 22: 
-                tl = test2
-            else:
-                tls.append(tl)
-                tl = w
-        if tl: tls.append(tl)
+        tls = wrap_text(tk["text"][:140], font_small, panel_w - 22)
         
         for tli, tln in enumerate(tls[:2]):
             screen.blit(font_small.render(tln, True, (200, 220, 240)), (px + 10, ty2 + 16 + tli * 13))
@@ -602,10 +611,10 @@ class Agent:
             arch=next((a for a in all_agents if a.agent_type=="architect"),None)
             if arch and arch.completed_instruction!=instr:
                 self.current_thought="Waiting for blueprint..."; return False
-            if done:
-                self.current_thought="Pipeline complete."; return False
             if self.completed_instruction==instr and self.completed_iteration==iteration:
                 self.current_thought="Waiting for QA..."; return False
+            if done:
+                self.current_thought="Pipeline complete."; return False
             return self._do_llm_call(all_agents,instr,iteration)
         elif self.agent_type=="validator":
             arch=next((a for a in all_agents if a.agent_type=="architect"),None)
@@ -736,8 +745,11 @@ class Agent:
         for filename in files_to_read:
             filepath = os.path.join("workspace", filename)
             if os.path.exists(filepath):
-                with open(filepath, "r", encoding="utf-8") as f:
-                    context += f"\n--- {filename.upper()} ---\n{f.read()}\n"
+                try:
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        context += f"\n--- {filename.upper()} ---\n{f.read()}\n"
+                except Exception as e:
+                    print(f"[{self.name}] Could not read {filename}: {e}")
 
         sys_prompt = (
             "You are Gemini, the Senior Principal Developer. "
@@ -806,10 +818,23 @@ class Agent:
                     cur_file=stripped[8:-3].strip(); cur_lines=[]
                 else: cur_lines.append(line)
             if cur_file and cur_lines: sections[cur_file]="\n".join(cur_lines).strip()
-            if not sections: sections["backend.py" if "flask" in raw.lower() else "app.py"]=raw
+            if not sections:
+                # Fallback: guess filename from content keywords
+                if "flask" in raw.lower() or "fastapi" in raw.lower():
+                    fallback = "backend.py"
+                elif raw.strip().startswith("<!DOCTYPE") or "<html" in raw.lower():
+                    fallback = "frontend.html"
+                else:
+                    fallback = "app.py"
+                sections[fallback] = raw
             written=[]
             for fname,code in sections.items():
-                fpath=os.path.join("workspace",os.path.basename(fname))
+                safe_name = os.path.basename(fname)
+                # Guard against path traversal / absolute paths from LLM
+                if not safe_name or safe_name.startswith("."):
+                    print(f"[{self.name}] Skipping unsafe filename: {fname!r}")
+                    continue
+                fpath=os.path.join("workspace", safe_name)
                 try:
                     with open(fpath,"w",encoding="utf-8") as f: f.write(code)
                     written.append(os.path.basename(fname))
@@ -855,12 +880,15 @@ class Agent:
 # ═══════════════════════════════════════════════════════════
 #  THREAD LOOP
 # ═══════════════════════════════════════════════════════════
-def agent_loop(agent,all_agents,ready_event):
+def agent_loop(agent, all_agents, ready_event):
     ready_event.wait()
     while True:
         if not agent.is_thinking:
-            agent.think(all_agents)
-        time.sleep(random.uniform(3,6))
+            did_work = agent.think(all_agents)
+            # Back off longer when idle to reduce busy-waiting
+            time.sleep(random.uniform(1, 3) if did_work else random.uniform(4, 8))
+        else:
+            time.sleep(0.5)
 
 # ═══════════════════════════════════════════════════════════
 #  BACKGROUND
